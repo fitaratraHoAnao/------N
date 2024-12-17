@@ -6,6 +6,7 @@ const fs = require("fs");
 const autoReact = require("./handle/autoReact");
 const unsendReact = require("./handle/unsendReact");
 const chalk = require("chalk");
+const axios = require("axios");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,7 +23,7 @@ global.NashBoT = {
 };
 
 global.NashBot = {
-  JOSHUA: "https://nash-api-vrx5.onrender.com/"
+  JOSHUA: "https://nash-api-vrx5.onrender.com/",
 };
 
 let isLoggedIn = false;
@@ -30,26 +31,36 @@ let loginAttempts = 0;
 const MAX_RETRIES = 5;
 const RETRY_INTERVAL = 5000;
 
+const MAX_MESSAGE_LENGTH = 2000; // Limite pour la réponse en morceaux
+
 const loadModules = (type) => {
   const folderPath = path.join(__dirname, type);
-  const files = fs.readdirSync(folderPath).filter(file => file.endsWith(".js"));
+  const files = fs.readdirSync(folderPath).filter((file) => file.endsWith(".js"));
 
   console.log(chalk.bold.redBright(`──LOADING ${type.toUpperCase()}──●`));
-  
-  files.forEach(file => {
+
+  files.forEach((file) => {
     const module = require(path.join(folderPath, file));
     if (module && module.name && module[type === "commands" ? "execute" : "onEvent"]) {
       module.nashPrefix = module.nashPrefix !== undefined ? module.nashPrefix : true;
       global.NashBoT[type].set(module.name, module);
       console.log(
-        chalk.bold.gray("[") + 
-        chalk.bold.cyan("INFO") + 
-        chalk.bold.gray("] ") + 
-        chalk.bold.green(`Loaded ${type.slice(0, -1)}: `) + 
-        chalk.bold.magenta(module.name)
+        chalk.bold.gray("[") +
+          chalk.bold.cyan("INFO") +
+          chalk.bold.gray("] ") +
+          chalk.bold.green(`Loaded ${type.slice(0, -1)}: `) +
+          chalk.bold.magenta(module.name)
       );
     }
   });
+};
+
+const sendLongMessage = async (api, threadID, message) => {
+  for (let i = 0; i < message.length; i += MAX_MESSAGE_LENGTH) {
+    const messagePart = message.substring(i, i + MAX_MESSAGE_LENGTH);
+    await api.sendMessage(messagePart, threadID);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
 };
 
 const AutoLogin = async () => {
@@ -60,12 +71,7 @@ const AutoLogin = async () => {
     const appState = JSON.parse(fs.readFileSync(appStatePath, "utf8"));
     login({ appState }, (err, api) => {
       if (err) {
-        console.error(
-          chalk.bold.gray("[") + 
-          chalk.bold.red("ERROR") + 
-          chalk.bold.gray("] ") + 
-          chalk.bold.redBright("Failed to auto-login:")
-        );
+        console.error(chalk.bold.red("Failed to auto-login"));
         retryLogin();
         return;
       }
@@ -80,23 +86,11 @@ const AutoLogin = async () => {
 
 const retryLogin = () => {
   if (loginAttempts >= MAX_RETRIES) {
-    console.error(
-      chalk.bold.gray("[") + 
-      chalk.bold.red("ERROR") + 
-      chalk.bold.gray("] ") + 
-      chalk.bold.redBright("Max login attempts reached. Please check your appstate file.")
-    );
+    console.error(chalk.bold.red("Max login attempts reached."));
     return;
   }
-
   loginAttempts++;
-  console.log(
-    chalk.bold.gray("[") + 
-    chalk.bold.yellow("RETRY") + 
-    chalk.bold.gray("] ") + 
-    chalk.bold.yellowBright(`Retrying login attempt ${loginAttempts} of ${MAX_RETRIES}...`)
-  );
-
+  console.log(chalk.bold.yellow(`Retrying login attempt ${loginAttempts}...`));
   setTimeout(AutoLogin, RETRY_INTERVAL);
 };
 
@@ -110,31 +104,74 @@ const setupBot = (api, prefix) => {
 
   api.listenMqtt((err, event) => {
     if (err) {
-      console.error(
-        chalk.bold.gray("[") + 
-        chalk.bold.red("ERROR") + 
-        chalk.bold.gray("] ") + 
-        chalk.bold.redBright("Connection error detected, attempting relogin...")
-      );
+      console.error(chalk.bold.red("Connection error detected, attempting relogin..."));
       isLoggedIn = false;
       retryLogin();
       return;
     }
-
     handleMessage(api, event, prefix);
     handleEvent(api, event, prefix);
     autoReact(api, event);
     unsendReact(api, event);
   });
+};
 
-  setInterval(() => {
-    api.getFriendsList(() => console.log(
-      chalk.bold.gray("[") + 
-      chalk.bold.cyan("INFO") + 
-      chalk.bold.gray("] ") + 
-      chalk.bold.green("Keep-alive signal sent")
-    ));
-  }, 1000 * 60 * 15);
+const handleMessage = async (api, event, prefix) => {
+  if (!event.body && !event.attachments) return;
+
+  const { threadID, senderID, body, attachments } = event;
+
+  let [command, ...args] = (body || "").trim().split(" ");
+  if (command.startsWith(prefix)) command = command.slice(prefix.length);
+
+  const cmdFile = global.NashBoT.commands.get(command.toLowerCase());
+  
+  // Logique pour commandes avec préfixe
+  if (cmdFile) {
+    try {
+      await cmdFile.execute(api, event, args, prefix);
+      return;
+    } catch (err) {
+      api.sendMessage(`Command error: ${err.message}`, threadID);
+      return;
+    }
+  }
+
+  // Logique pour les messages avec image (Gemini)
+  if (attachments && attachments.length > 0) {
+    const image = attachments.find((att) => att.type === "photo");
+    if (image) {
+      const imageUrl = image.url;
+      try {
+        const response = await axios.post("https://gemini-sary-prompt-espa-vercel-api.vercel.app/api/gemini", {
+          link: imageUrl,
+          prompt: "Décrire cette photo en détail",
+          customId: senderID,
+        });
+        const reply = response.data.message;
+        await sendLongMessage(api, threadID, reply);
+      } catch (err) {
+        console.error("Erreur avec l'API Gemini :", err.message);
+        api.sendMessage("Une erreur s'est produite lors de l'analyse de l'image.", threadID);
+      }
+      return;
+    }
+  }
+
+  // Logique par défaut pour Gemini si aucun préfixe/commande détecté
+  if (body) {
+    try {
+      const response = await axios.post("https://gemini-sary-prompt-espa-vercel-api.vercel.app/api/gemini", {
+        prompt: body,
+        customId: senderID,
+      });
+      const reply = response.data.message;
+      await sendLongMessage(api, threadID, reply);
+    } catch (err) {
+      console.error("Erreur avec l'API Gemini :", err.message);
+      api.sendMessage("Désolé, une erreur s'est produite lors du traitement de votre message.", threadID);
+    }
+  }
 };
 
 const handleEvent = async (api, event, prefix) => {
@@ -144,36 +181,7 @@ const handleEvent = async (api, event, prefix) => {
       await onEvent({ prefix, api, event });
     }
   } catch (err) {
-    console.error(
-      chalk.bold.gray("[") + 
-      chalk.bold.red("ERROR") + 
-      chalk.bold.gray("] ") + 
-      chalk.bold.redBright("Event handler error:")
-    );
-  }
-};
-
-const handleMessage = async (api, event, prefix) => {
-  if (!event.body) return;
-
-  let [command, ...args] = event.body.trim().split(" ");
-  if (command.startsWith(prefix)) command = command.slice(prefix.length);
-
-  const cmdFile = global.NashBoT.commands.get(command.toLowerCase());
-  if (cmdFile) {
-    const nashPrefix = cmdFile.nashPrefix !== false;
-    if (nashPrefix && !event.body.toLowerCase().startsWith(prefix)) return;
-
-    const userId = event.senderID;
-    if (cmdFile.role === "admin" && userId !== config.adminUID) {
-      return api.sendMessage("You don't have permission to use this commands", event.threadID);
-    }
-
-    try {
-      await cmdFile.execute(api, event, args, prefix);
-    } catch (err) {
-      api.sendMessage(`Command error: ${err.message}`, event.threadID);
-    }
+    console.error(chalk.bold.red("Event handler error"));
   }
 };
 
@@ -182,15 +190,6 @@ const init = async () => {
   await loadModules("events");
   await AutoLogin();
   console.log(chalk.bold.blueBright("──BOT START──●"));
-  console.log(chalk.bold.red(`
- █▄░█ ▄▀█ █▀ █░█
- █░▀█ █▀█ ▄█ █▀█`));
-  console.log(chalk.bold.yellow("Credits: Joshua Apostol"));
 };
 
-init().then(() => app.listen(PORT, () => console.log(
-  chalk.bold.gray("[") + 
-  chalk.bold.green("SERVER") + 
-  chalk.bold.gray("] ") + 
-  chalk.bold.greenBright(`Running on http://localhost:${PORT}`)
-)));
+init().then(() => app.listen(PORT, () => console.log(chalk.bold.green(`Running on http://localhost:${PORT}`))));
